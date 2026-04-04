@@ -1,10 +1,12 @@
 import os
 import google.generativeai as genai
 from typing import Dict, Any, Optional, Tuple
-from models import ChatResponse, IntentType
+from models.api import ChatResponse
+from models.enum import  IntentType
 from conversation_manager import ConversationManager
 from symptom_triage import SymptomTriageService
 from appointment_manager import AppointmentManager, BookingState
+from models.state import FlowType
 
 # Configure Gemini
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -52,80 +54,138 @@ class AIAgentService:
         suggestions = []
         
         try:
-            if intent == IntentType.GREETING.value:
+            if session.active_flow == FlowType.BOOKING:
+                context = session.booking_context
+                if context and context.state not in [BookingState.COMPLETED, BookingState.CANCELLED]:
+                    response_text, updated_context, suggestions, action_data = \
+                        await self.booking_sm.process_step(user_id, message, context, jwt_token)
+                    
+                    session.booking_context = updated_context
+                    
+                    if updated_context.state in [BookingState.COMPLETED, BookingState.CANCELLED]:
+                        session.clear_active_flow()
+            
+            elif session.active_flow == FlowType.CANCELLATION:
+                context = session.cancellation_context
+                if context and context.state not in [CancellationState.COMPLETED, CancellationState.ABORTED]:
+                    response_text, updated_context, suggestions, action_data = \
+                        await self.cancellation_sm.process_step(user_id, message, context, jwt_token)
+                    
+                    session.cancellation_context = updated_context
+                    
+                    if updated_context.state in [CancellationState.COMPLETED, CancellationState.ABORTED]:
+                        session.clear_active_flow()
+            
+            elif session.active_flow == FlowType.RESCHEDULING:
+                context = session.rescheduling_context
+                if context and context.state not in [ReschedulingState.COMPLETED, ReschedulingState.ABORTED]:
+                    response_text, updated_context, suggestions, action_data = \
+                        await self.rescheduling_sm.process_step(user_id, message, context, jwt_token)
+                    
+                    session.rescheduling_context = updated_context
+                    
+                    if updated_context.state in [ReschedulingState.COMPLETED, ReschedulingState.ABORTED]:
+                        session.clear_active_flow()
+            
+
+            elif intent == IntentType.BOOK_APPOINTMENT.value:
+                # Start booking flow
+                from models.state import BookingContext
+                session.booking_context = BookingContext()
+                session.active_flow = FlowType.BOOKING
+                
+                response_text, updated_context, suggestions, action_data = \
+                    await self.booking_sm.process_step(user_id, message, session.booking_context, jwt_token)
+                
+                session.booking_context = updated_context
+            
+            elif intent == IntentType.CANCEL_APPOINTMENT.value:
+                # Start cancellation flow
+                from models.state import CancellationContext
+                session.cancellation_context = CancellationContext()
+                session.active_flow = FlowType.CANCELLATION
+                
+                response_text, updated_context, suggestions, action_data = \
+                    await self.cancellation_sm.process_step(user_id, message, session.cancellation_context, jwt_token)
+                
+                session.cancellation_context = updated_context
+            
+            elif intent == IntentType.RESCHEDULE_APPOINTMENT.value:
+                # Start rescheduling flow
+                from models.state import ReschedulingContext
+                session.rescheduling_context = ReschedulingContext()
+                session.active_flow = FlowType.RESCHEDULING
+                
+                response_text, updated_context, suggestions, action_data = \
+                    await self.rescheduling_sm.process_step(user_id, message, session.rescheduling_context, jwt_token)
+                
+                session.rescheduling_context = updated_context
+            
+            elif intent == IntentType.GREETING.value:
                 response_text = self._handle_greeting(user_id)
-                suggestions = [
-                    "Find a doctor",
-                    "Book appointment",
-                    "Check symptoms",
-                    "View my appointments"
-                ]
+                suggestions = ["Find doctor", "Book appointment", "My appointments"]
             
             elif intent == IntentType.SYMPTOM_CHECK.value:
                 response_text, action_data = self._handle_symptom_check(message)
-                suggestions = ["Book appointment", "Find specialist", "Emergency help"]
+                suggestions = ["Book appointment", "Find specialist"]
             
-            elif intent == IntentType.SEARCH_DOCTOR.value or intent == IntentType.CHECK_AVAILABILITY.value:
-                response_text, action_data, suggestions = self._handle_doctor_search(message, session)
+            elif intent == IntentType.SEARCH_DOCTOR.value:
+                response_text, action_data, suggestions = await self._handle_doctor_search(message, session)
             
-            elif intent == IntentType.BOOK_APPOINTMENT.value:
-                response_text, action_data, suggestions = await self._handle_booking_flow(
-                    user_id, message, session, jwt_token
-                )
+            elif intent == IntentType.VIEW_APPOINTMENTS.value:
+                response_text = self._handle_view_appointments(user_id, jwt_token)
+                suggestions = ["Cancel appointment", "Reschedule appointment"]
             
             elif intent == IntentType.CANCEL_POLICY.value:
                 response_text = self._handle_cancel_policy()
             
-            elif intent == IntentType.VIEW_APPOINTMENTS.value:
-                response_text = self._handle_view_appointments(user_id, jwt_token)
-                
             elif intent == IntentType.FAREWELL.value:
                 response_text = self._handle_farewell(user_id)
                 self.conversation_manager.end_session(user_id)
             
             else:
-                # General query
                 response_text = self._generate_general_response(message, conversation_history)
-                suggestions = ["Book appointment", "Find doctor", "Check symptoms"]
+                suggestions = ["Book appointment", "Find doctor", "My appointments"]
         
         except Exception as e:
-            print(f"[AI Agent] Error processing message: {e}")
-            response_text = "I apologize, but I'm having trouble processing your request. Please try again or rephrase your question."
+            print(f"[AI Agent] Error: {e}")
+            import traceback
+            traceback.print_exc()
+            response_text = "I encountered an error. Please try again."
         
-        # Add assistant response to history
+        # Save session
+        self.conversation_manager._save_session(session)
+        
+        # Add response to history
         self.conversation_manager.add_message(user_id, "assistant", response_text)
         
         return ChatResponse(
             response=response_text,
             intent=intent,
             data=action_data,
-            suggestions=suggestions[:4] if suggestions else None  # Limit to 4 suggestions
+            suggestions=suggestions[:4] if suggestions else None
         )
     
     def _classify_intent(self, message: str, context: str = "") -> str:
         """Classify user intent using AI"""
         if not self.model:
             return self._fallback_intent_classification(message)
-        
+
         prompt = f"""Classify the user's intent into ONE of these categories:
-- GREETING: Greetings like hello, hi, good morning
-- SYMPTOM_CHECK: Describing symptoms or health issues
-- SEARCH_DOCTOR: Looking for doctors, asking about specialists
-- CHECK_AVAILABILITY: Asking about doctor availability or open slots
-- BOOK_APPOINTMENT: Wanting to book/schedule an appointment
-- CANCEL_APPOINTMENT: Want to cancel an appointment
-- RESCHEDULE_APPOINTMENT: Want to change appointment time
-- VIEW_APPOINTMENTS: Want to see their appointments
-- CANCEL_POLICY: Asking about cancellation or refund policy
-- INSURANCE_QUERY: Questions about insurance
-- FAREWELL: Goodbye, bye, thanks and ending conversation
-- PATIENT_QUERY: General questions about clinic, services, etc.
-
-{f"Recent conversation context: {context}" if context else ""}
-
-Current message: "{message}"
-
-Respond with ONLY the category name (e.g., BOOK_APPOINTMENT)."""
+        - GREETING: Greetings like hello, hi, good morning
+        - SYMPTOM_CHECK: Describing symptoms or health issues
+        - SEARCH_DOCTOR: Looking for doctors, asking about specialists
+        - CHECK_AVAILABILITY: Asking about doctor availability or open slots
+        - BOOK_APPOINTMENT: Wanting to book/schedule an appointment
+        - CANCEL_APPOINTMENT: Want to cancel an appointment
+        - RESCHEDULE_APPOINTMENT: Want to change appointment time
+        - VIEW_APPOINTMENTS: Want to see their appointments
+        - FAREWELL: Goodbye, bye, thanks and ending conversation
+        - PATIENT_QUERY: General questions about clinic, services, etc.
+        
+        {f"Recent conversation context: {context}" if context else ""}
+        Current message: "{message}"        
+        Respond with ONLY the category name (e.g., BOOK_APPOINTMENT)."""
 
         try:
             response = self.model.generate_content(prompt)
@@ -300,137 +360,7 @@ Respond with ONLY the category name (e.g., BOOK_APPOINTMENT)."""
                 return last_word
         
         return ""
-    
-    async def _handle_booking_flow(self, user_id: str, message: str, session: Dict, jwt_token: Optional[str]) -> Tuple[str, Optional[Dict], list]:
-        """Handle multi-turn appointment booking flow"""
-        
-        if not jwt_token:
-            return (
-                "To book an appointment, you need to be logged in. "
-                "Please log in to your account and try again."
-            ), None, ["Login", "Create account"]
-        
-        # Get current booking state from session
-        booking_state = session.get("context", {}).get("booking_state", BookingState.INITIAL.value)
-        
-        # Extract booking information from message
-        booking_info = self.appointment_manager.extract_booking_info(message, session.get("context", {}))
-        
-        # Update context with extracted info
-        if booking_info:
-            self.conversation_manager.update_session_context(user_id, booking_info)
-            session = self.conversation_manager.get_session(user_id)
-        
-        context = session.get("context", {})
-        
-        # State machine for booking flow
-        if not context.get("doctor_id"):
-            # Need to select doctor first
-            return self._booking_step_select_doctor(message, context)
-        
-        elif not context.get("date"):
-            # Need to select date
-            return self._booking_step_select_date(message, context)
-        
-        elif not context.get("time"):
-            # Need to select time
-            return self._booking_step_select_time(message, context)
-        
-        else:
-            # All info collected, confirm
-            return self._booking_step_confirm(user_id, context, jwt_token)
-    
-    def _booking_step_select_doctor(self, message: str, context: Dict) -> Tuple[str, Optional[Dict], list]:
-        """Booking step 1: Select doctor"""
-        keyword = self._extract_search_keyword(message)
-        
-        if keyword:
-            return self._handle_doctor_search(message, {"user_id": context.get("user_id", ""), "context": context})
-        
-        return (
-            "To book an appointment, I need to know which doctor you'd like to see. "
-            "You can search by specialty (e.g., 'cardiologist') or doctor name."
-        ), None, ["Cardiologist", "Dermatologist", "Dentist"]
-    
-    def _booking_step_select_date(self, message: str, context: Dict) -> Tuple[str, Optional[Dict], list]:
-        """Booking step 2: Select date"""
-        date = self.appointment_manager.parse_date_from_text(message)
-        
-        if date:
-            # Check available slots for this date
-            doctor_id = context.get("doctor_id")
-            if doctor_id:
-                slots_result = self.appointment_manager.get_available_slots(doctor_id, date)
-                
-                # Handle errors
-                if not slots_result.get("success"):
-                    error_message = slots_result.get("message", "Unable to fetch available slots")
-                    error_code = slots_result.get("error_code")
-                    
-                    if error_code == "PAST_DATE":
-                        return (
-                            error_message + " Please select a future date."
-                        ), None, ["Tomorrow", "Day after tomorrow", "Next week"]
-                    elif error_code == "NO_SLOTS_FOUND":
-                        return (
-                            f"Sorry, no slots available on {date}. "
-                            "Would you like to try another date?"
-                        ), None, ["Tomorrow", "Day after tomorrow", "Next week"]
-                    else:
-                        return (
-                            f"{error_message}. Would you like to try another date?"
-                        ), None, ["Tomorrow", "Try again"]
-                
-                slots = slots_result.get("data", [])
-                
-                if slots:
-                    formatted_slots = self.appointment_manager.format_available_slots(slots)
-                    return (
-                        f"Great! Here are available time slots for {date}:\n\n{formatted_slots}\n\n"
-                        "Which time works best for you?"
-                    ), {"available_slots": slots, "date": date}, []
-                else:
-                    return (
-                        f"Sorry, no slots available on {date}. "
-                        "Would you like to try another date?"
-                    ), None, ["Tomorrow", "Day after tomorrow", "Next week"]
-        
-        return (
-            "When would you like to schedule the appointment? "
-            "You can say something like 'tomorrow', 'next Monday', or provide a specific date."
-        ), None, ["Tomorrow", "Day after tomorrow", "Next week"]
-    
-    def _booking_step_select_time(self, message: str, context: Dict) -> Tuple[str, Optional[Dict], list]:
-        """Booking step 3: Select time"""
-        time = self.appointment_manager.parse_time_from_text(message)
-        
-        if time:
-            return (
-                f"Perfect! Let me confirm your appointment:\n\n"
-                f"📅 Date: {context.get('date')}\n"
-                f"🕐 Time: {time}\n"
-                f"👨‍⚕️ Doctor: {context.get('doctor_name', 'Selected doctor')}\n\n"
-                "Please confirm to book this appointment."
-            ), {"time": time}, ["Confirm", "Cancel"]
-        
-        return (
-            "What time would you prefer? "
-            "You can say something like '3:00 PM' or '15:00'."
-        ), None, []
-    
-    def _booking_step_confirm(self, user_id: str, context: Dict, jwt_token: Optional[str]) -> Tuple[str, Optional[Dict], list]:
-        """Booking step 4: Confirm and create appointment"""
-        # This would make an actual API call to book the appointment
-        # For now, return confirmation message
-        return (
-            "✅ Your appointment has been booked successfully!\n\n"
-            f"📅 Date: {context.get('date')}\n"
-            f"🕐 Time: {context.get('time')}\n"
-            f"👨‍⚕️ Doctor: {context.get('doctor_name', 'Doctor')}\n\n"
-            "You will receive a confirmation email and SMS shortly. "
-            "You can view all your appointments in 'My Appointments'."
-        ), {"booking_confirmed": True}, ["View appointments", "Book another"]
-    
+     
     def _handle_cancel_policy(self) -> str:
         """Handle cancellation policy query"""
         return (

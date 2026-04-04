@@ -1,3 +1,4 @@
+import httpx
 import requests
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
@@ -23,7 +24,7 @@ class AppointmentManager:
         self.backend_url = backend_url.rstrip('/')
         self.logger = logging.getLogger(__name__)
     
-    def search_doctors(self, keyword: str) -> Dict[str, Any]:
+    async def search_doctors(self, keyword: str) -> Dict[str, Any]:
         """Search for doctors by keyword (name, specialty, city)"""
         # Validate input
         if not keyword or not keyword.strip():
@@ -97,7 +98,7 @@ class AppointmentManager:
                 "error_code": "UNKNOWN_ERROR"
             }
     
-    def get_doctor_by_id(self, doctor_id: str) -> Dict[str, Any]:
+    async def get_doctor_by_id(self, doctor_id: str) -> Dict[str, Any]:
         """Get doctor details by ID"""
         # Validate input
         if not doctor_id or not doctor_id.strip():
@@ -151,7 +152,7 @@ class AppointmentManager:
                 "error_code": "UNKNOWN_ERROR"
             }
     
-    def get_specialists(self) -> List[Dict]:
+    async def get_specialists(self) -> List[Dict]:
         """Get list of all specialties"""
         try:
             response = requests.get(
@@ -167,7 +168,7 @@ class AppointmentManager:
             self.logger.error(f"Error getting specialists: {e}", exc_info=True)
             return []
     
-    def get_available_slots(self, doctor_id: str, date: str) -> Dict[str, Any]:
+    async def get_available_slots(self, doctor_id: str, date: str) -> Dict[str, Any]:
         """Get available time slots for a doctor on a specific date"""
         # Validate inputs
         if not doctor_id or not doctor_id.strip():
@@ -268,7 +269,7 @@ class AppointmentManager:
                 "error_code": "UNKNOWN_ERROR"
             }
     
-    def parse_date_from_text(self, text: str) -> Optional[str]:
+    async def parse_date_from_text(self, text: str) -> Optional[str]:
         """Parse natural language date into ISO format"""
         text_lower = text.lower()
         today = datetime.now().date()
@@ -308,7 +309,7 @@ class AppointmentManager:
         
         return None
     
-    def parse_time_from_text(self, text: str) -> Optional[str]:
+    async def parse_time_from_text(self, text: str) -> Optional[str]:
         """Parse natural language time into HH:MM:SS format"""
         text_lower = text.lower()
         
@@ -345,7 +346,7 @@ class AppointmentManager:
         
         return None
     
-    def extract_booking_info(self, message: str, current_context: Dict) -> Dict:
+    async def extract_booking_info(self, message: str, current_context: Dict) -> Dict:
         """
         Extract booking information from user message
         Updates the booking context with new information found
@@ -366,14 +367,14 @@ class AppointmentManager:
         
         return updates
     
-    def format_doctor_info(self, doctor: Dict) -> str:
+    async def format_doctor_info(self, doctor: Dict) -> str:
         """Format doctor information for display"""
         return (
             f"Dr. {doctor.get('firstName', '')} {doctor.get('lastName', '')} "
             f"({doctor.get('specialist', 'General Practitioner')})"
         )
     
-    def format_available_slots(self, slots: List[str]) -> str:
+    async def format_available_slots(self, slots: List[str]) -> str:
         """Format available time slots for display"""
         if not slots:
             return "No available slots"
@@ -393,7 +394,7 @@ class AppointmentManager:
         
         return "\n".join(result)
     
-    def _format_time_12hr(self, time_24hr: str) -> str:
+    async def _format_time_12hr(self, time_24hr: str) -> str:
         """Convert 24-hour time to 12-hour format"""
         hour, minute, _ = time_24hr.split(':')
         hour = int(hour)
@@ -406,3 +407,285 @@ class AppointmentManager:
             return f"12:{minute} PM"
         else:
             return f"{hour-12}:{minute} PM"
+
+    async def book_appointment(
+            self,
+            booking_data: Dict[str, str],
+            jwt_token: str
+    ) -> Dict[str, Any]:
+        """
+        Book an appointment via backend API
+
+        Args:
+            booking_data: {"doctorId": "...", "date": "...", "slotTime": "..."}
+            jwt_token: User's JWT token for authentication
+
+        Returns:
+            {"success": bool, "message": str, "data": {...}}
+        """
+        if not jwt_token:
+            return {
+                "success": False,
+                "message": "Authentication required",
+                "error_code": "UNAUTHORIZED"
+            }
+
+        try:
+            response = await self.client.post(
+                f"{self.backend_url}/api/appointment/book",
+                json=booking_data,
+                headers={"Authorization": f"Bearer {jwt_token}"}
+            )
+
+            if response.status_code == 201 or response.status_code == 200:
+                data = response.json()
+                return {
+                    "success": True,
+                    "message": "Appointment booked successfully",
+                    "data": data.get("data", {})
+                }
+            elif response.status_code == 409:
+                return {
+                    "success": False,
+                    "message": "This slot is no longer available. Please choose another time.",
+                    "error_code": "SLOT_CONFLICT"
+                }
+            elif response.status_code == 401:
+                return {
+                    "success": False,
+                    "message": "Your session has expired. Please log in again.",
+                    "error_code": "UNAUTHORIZED"
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": f"Booking failed (Status: {response.status_code})",
+                    "error_code": "SERVER_ERROR"
+                }
+
+        except httpx.TimeoutException:
+            return {
+                "success": False,
+                "message": "Request timeout. Please try again.",
+                "error_code": "TIMEOUT"
+            }
+        except Exception as e:
+            self.logger.error(f"Error booking appointment: {e}", exc_info=True)
+            return {
+                "success": False,
+                "message": "Failed to connect to booking service",
+                "error_code": "NETWORK_ERROR"
+            }
+
+    async def get_user_appointments(
+        self,
+        jwt_token: str,
+        status: str = "ALL"  # ALL, UPCOMING, PAST, CANCELLED
+    ) -> Dict[str, Any]:
+        """
+        Get user's appointments
+        
+        Args:
+            jwt_token: User's JWT token
+            status: Filter by status (ALL, UPCOMING, PAST, CANCELLED)
+        
+        Returns:
+            {"success": bool, "message": str, "data": [...]}
+        """
+        if not jwt_token:
+            return {
+                "success": False,
+                "message": "Authentication required",
+                "error_code": "UNAUTHORIZED"
+            }
+        
+        try:
+            params = {}
+            if status != "ALL":
+                params["status"] = status
+            
+            response = await self.client.get(
+                f"{self.backend_url}/api/appointment/user",
+                headers={"Authorization": f"Bearer {jwt_token}"},
+                params=params
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                appointments = data.get("data", [])
+                return {
+                    "success": True,
+                    "message": f"Found {len(appointments)} appointment(s)",
+                    "data": appointments
+                }
+            elif response.status_code == 401:
+                return {
+                    "success": False,
+                    "message": "Session expired. Please log in again.",
+                    "error_code": "UNAUTHORIZED"
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": f"Failed to fetch appointments (Status: {response.status_code})",
+                    "error_code": "SERVER_ERROR"
+                }
+        
+        except Exception as e:
+            self.logger.error(f"Error fetching appointments: {e}", exc_info=True)
+            return {
+                "success": False,
+                "message": "Failed to connect to server",
+                "error_code": "NETWORK_ERROR"
+            }
+    
+    async def cancel_appointment(
+        self,
+        appointment_id: str,
+        jwt_token: str,
+        reason: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Cancel an appointment
+        
+        Args:
+            appointment_id: Appointment ID to cancel
+            jwt_token: User's JWT token
+            reason: Optional cancellation reason
+        
+        Returns:
+            {"success": bool, "message": str, "data": {...}}
+        """
+        if not jwt_token:
+            return {
+                "success": False,
+                "message": "Authentication required",
+                "error_code": "UNAUTHORIZED"
+            }
+        
+        try:
+            payload = {"appointmentId": appointment_id}
+            if reason:
+                payload["reason"] = reason
+            
+            response = await self.client.post(
+                f"{self.backend_url}/api/appointment/cancel",
+                json=payload,
+                headers={"Authorization": f"Bearer {jwt_token}"}
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                return {
+                    "success": True,
+                    "message": "Appointment cancelled successfully",
+                    "data": data.get("data", {})
+                }
+            elif response.status_code == 400:
+                return {
+                    "success": False,
+                    "message": "Cannot cancel this appointment (may be too close to scheduled time)",
+                    "error_code": "INVALID_CANCELLATION"
+                }
+            elif response.status_code == 404:
+                return {
+                    "success": False,
+                    "message": "Appointment not found",
+                    "error_code": "NOT_FOUND"
+                }
+            elif response.status_code == 401:
+                return {
+                    "success": False,
+                    "message": "Session expired. Please log in again.",
+                    "error_code": "UNAUTHORIZED"
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": f"Cancellation failed (Status: {response.status_code})",
+                    "error_code": "SERVER_ERROR"
+                }
+        
+        except Exception as e:
+            self.logger.error(f"Error cancelling appointment: {e}", exc_info=True)
+            return {
+                "success": False,
+                "message": "Failed to cancel appointment",
+                "error_code": "NETWORK_ERROR"
+            }
+    
+    async def reschedule_appointment(
+        self,
+        appointment_id: str,
+        reschedule_data: Dict[str, str],
+        jwt_token: str
+    ) -> Dict[str, Any]:
+        """
+        Reschedule an appointment
+        
+        Args:
+            appointment_id: Appointment ID to reschedule
+            reschedule_data: {"newDate": "YYYY-MM-DD", "newSlotTime": "HH:MM:SS"}
+            jwt_token: User's JWT token
+        
+        Returns:
+            {"success": bool, "message": str, "data": {...}}
+        """
+        if not jwt_token:
+            return {
+                "success": False,
+                "message": "Authentication required",
+                "error_code": "UNAUTHORIZED"
+            }
+        
+        try:
+            payload = {
+                "appointmentId": appointment_id,
+                **reschedule_data
+            }
+            
+            response = await self.client.post(
+                f"{self.backend_url}/api/appointment/reschedule",
+                json=payload,
+                headers={"Authorization": f"Bearer {jwt_token}"}
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                return {
+                    "success": True,
+                    "message": "Appointment rescheduled successfully",
+                    "data": data.get("data", {})
+                }
+            elif response.status_code == 409:
+                return {
+                    "success": False,
+                    "message": "Selected slot is no longer available",
+                    "error_code": "SLOT_CONFLICT"
+                }
+            elif response.status_code == 400:
+                return {
+                    "success": False,
+                    "message": "Invalid reschedule request",
+                    "error_code": "INVALID_REQUEST"
+                }
+            elif response.status_code == 401:
+                return {
+                    "success": False,
+                    "message": "Session expired. Please log in again.",
+                    "error_code": "UNAUTHORIZED"
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": f"Reschedule failed (Status: {response.status_code})",
+                    "error_code": "SERVER_ERROR"
+                }
+        
+        except Exception as e:
+            self.logger.error(f"Error rescheduling appointment: {e}", exc_info=True)
+            return {
+                "success": False,
+                "message": "Failed to reschedule appointment",
+                "error_code": "NETWORK_ERROR"
+            }

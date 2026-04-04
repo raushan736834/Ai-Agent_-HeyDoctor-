@@ -1,16 +1,16 @@
-from fastapi import FastAPI, HTTPException, Header
+import os
+from typing import Optional
+from dotenv import load_dotenv
+from fastapi import FastAPI, Header
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, ValidationError as PydanticValidationError
+from pydantic import ValidationError as PydanticValidationError
+from models.api import ChatResponse, ChatRequest, ValidationError
 from service import AIAgentService
-from models import ChatRequest, ChatResponse, ValidationError
-import os
-from dotenv import load_dotenv
-from typing import Optional
+from utils.JwtExtractor import extract_user_id_from_jwt
 
 load_dotenv()
-
 app = FastAPI(
     title="AI Medical Appointment Agent",
     description="Intelligent AI agent for medical appointment booking and patient assistance",
@@ -64,23 +64,10 @@ async def chat_endpoint(request: ChatRequest, authorization: Optional[str] = Hea
     """
     try:
         # Validate request
-        if not request.user_id or not request.user_id.strip():
-            return ChatResponse(
-                response="User ID is required",
-                success=False,
-                message="User ID is required",
-                validation_errors=[ValidationError(
-                    field="user_id",
-                    message="User ID cannot be empty",
-                    error_code="REQUIRED_FIELD"
-                )]
-            )
-        
         if not request.message or not request.message.strip():
             return ChatResponse(
                 response="Message cannot be empty",
                 success=False,
-                message="Message cannot be empty",
                 validation_errors=[ValidationError(
                     field="message",
                     message="Message cannot be empty",
@@ -90,17 +77,19 @@ async def chat_endpoint(request: ChatRequest, authorization: Optional[str] = Hea
         
         # Extract JWT token from Authorization header if present
         jwt_token = None
+        user_id='anonymous'
         if authorization and authorization.startswith("Bearer "):
             jwt_token = authorization[7:]  # Remove "Bearer " prefix
-        elif request.jwt_token:
-            jwt_token = request.jwt_token
+            user_id = extract_user_id_from_jwt(jwt_token)
+
         
         response = await agent_service.process_message(
-            request.user_id, 
-            request.message,
-            jwt_token
+            user_id=user_id,
+            message=request.message,
+            jwt_token=jwt_token
         )
         return response
+
     except PydanticValidationError as e:
         # Handle Pydantic validation errors
         validation_errors = [
@@ -114,7 +103,6 @@ async def chat_endpoint(request: ChatRequest, authorization: Optional[str] = Hea
         return ChatResponse(
             response="Please check your input and try again",
             success=False,
-            message="Validation failed",
             validation_errors=validation_errors
         )
     except ValueError as e:
@@ -122,7 +110,6 @@ async def chat_endpoint(request: ChatRequest, authorization: Optional[str] = Hea
         return ChatResponse(
             response=str(e),
             success=False,
-            message=str(e),
             validation_errors=[ValidationError(
                 field="general",
                 message=str(e),
@@ -136,7 +123,6 @@ async def chat_endpoint(request: ChatRequest, authorization: Optional[str] = Hea
         return ChatResponse(
             response="An unexpected error occurred. Please try again later.",
             success=False,
-            message="Internal server error",
             intent="UNKNOWN"
         )
 
