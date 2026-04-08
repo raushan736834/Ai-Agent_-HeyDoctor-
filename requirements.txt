@@ -6,3 +6,5 @@ pydantic==2.6.0
 python-dotenv==1.0.1
 redis==5.0.1
 python-dateutil==2.8.2
+
+langchain-community
